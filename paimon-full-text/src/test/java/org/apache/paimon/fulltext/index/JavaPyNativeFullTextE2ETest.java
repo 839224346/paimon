@@ -126,6 +126,31 @@ public class JavaPyNativeFullTextE2ETest {
                         "中文分词支持更自然的全文检索",
                         "默认英文分词不适合中文语义"),
                 "jieba");
+
+        writeTableWithNativeFullTextIndex(
+                "test_native_fulltext_icu",
+                Arrays.asList(
+                        "张华在百货公司当售货员",
+                        "Apache Paimon 支持中文全文检索",
+                        "全文索引提供高效的文本检索能力",
+                        "中文分词支持更自然的全文检索",
+                        "ICU分词器使用Unicode规则进行分词"),
+                "icu");
+
+        writeTableWithNativeFullTextIndexCustomOptions(
+                "test_native_fulltext_ngram_tokenchars",
+                Arrays.asList("abc123def", "hello world", "xyz789ghi", "test456ing", "paimon lake"),
+                ngramTokenCharsOptions());
+
+        writeTableWithNativeFullTextIndexCustomOptions(
+                "test_native_fulltext_icu_normalize",
+                Arrays.asList(
+                        "Ａpache Paimon",
+                        "Apache Flink",
+                        "Ｐaimon supports NFKC normalization",
+                        "Regular text without special chars",
+                        "Ｆullwidth letters are normalized"),
+                icuNormalizeOptions());
     }
 
     private void writeTableWithNativeFullTextIndex(
@@ -246,5 +271,118 @@ public class JavaPyNativeFullTextE2ETest {
         assertThat(indexEntries).hasSize(1);
         assertThat(indexEntries.get(0).indexFile().indexType())
                 .isEqualTo(NativeFullTextGlobalIndexerFactory.IDENTIFIER);
+    }
+
+    private void writeTableWithNativeFullTextIndexCustomOptions(
+            String tableName, List<String> contents, Map<String, String> customOptions)
+            throws Exception {
+        Path tablePath = new Path(warehouse.toString() + "/default.db/" + tableName);
+        LocalFileIO fileIO = LocalFileIO.create();
+        if (fileIO.exists(tablePath)) {
+            fileIO.delete(tablePath, true);
+        }
+
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.STRING()},
+                        new String[] {"id", "content"});
+
+        Options options = new Options();
+        options.set(PATH, tablePath.toString());
+        options.set(ROW_TRACKING_ENABLED, true);
+        options.set(DATA_EVOLUTION_ENABLED, true);
+        options.set(GLOBAL_INDEX_ENABLED, true);
+
+        TableSchema tableSchema =
+                SchemaUtils.forceCommit(
+                        new SchemaManager(fileIO, tablePath),
+                        new Schema(
+                                rowType.getFields(),
+                                Collections.emptyList(),
+                                Collections.emptyList(),
+                                options.toMap(),
+                                ""));
+
+        AppendOnlyFileStoreTable table =
+                new AppendOnlyFileStoreTable(
+                        FileIOFinder.find(tablePath),
+                        tablePath,
+                        tableSchema,
+                        CatalogEnvironment.empty());
+
+        BatchWriteBuilder writeBuilder = table.newBatchWriteBuilder();
+        try (BatchTableWrite write = writeBuilder.newWrite();
+                BatchTableCommit commit = writeBuilder.newCommit()) {
+            for (int i = 0; i < contents.size(); i++) {
+                write.write(GenericRow.of(i, BinaryString.fromString(contents.get(i))));
+            }
+            commit.commit(write.prepareCommit());
+        }
+
+        DataField contentField = table.rowType().getField("content");
+        Options indexOptions = new Options();
+        for (Map.Entry<String, String> entry : customOptions.entrySet()) {
+            indexOptions.set(entry.getKey(), entry.getValue());
+        }
+
+        GlobalIndexSingleColumnWriter writer =
+                (GlobalIndexSingleColumnWriter)
+                        GlobalIndexBuilderUtils.createIndexWriter(
+                                table,
+                                NativeFullTextGlobalIndexerFactory.IDENTIFIER,
+                                contentField,
+                                indexOptions);
+
+        for (int i = 0; i < contents.size(); i++) {
+            writer.write(BinaryString.fromString(contents.get(i)), i);
+        }
+
+        List<ResultEntry> entries = writer.finish();
+        assertThat(entries).hasSize(1);
+        assertThat(entries.get(0).rowCount()).isEqualTo(contents.size());
+
+        Range rowRange = new Range(0, contents.size() - 1);
+        List<IndexFileMeta> indexFiles =
+                GlobalIndexBuilderUtils.toIndexFileMetas(
+                        table.fileIO(),
+                        table.store().pathFactory().globalIndexFileFactory(),
+                        table.coreOptions(),
+                        rowRange,
+                        contentField.id(),
+                        NativeFullTextGlobalIndexerFactory.IDENTIFIER,
+                        entries);
+
+        DataIncrement dataIncrement = DataIncrement.indexIncrement(indexFiles);
+        CommitMessage message =
+                new CommitMessageImpl(
+                        BinaryRow.EMPTY_ROW,
+                        0,
+                        null,
+                        dataIncrement,
+                        CompactIncrement.emptyIncrement());
+        try (BatchTableCommit commit = writeBuilder.newCommit()) {
+            commit.commit(Collections.singletonList(message));
+        }
+
+        List<org.apache.paimon.manifest.IndexManifestEntry> indexEntries =
+                table.indexManifestFileReader().read(table.latestSnapshot().get().indexManifest());
+        assertThat(indexEntries).hasSize(1);
+        assertThat(indexEntries.get(0).indexFile().indexType())
+                .isEqualTo(NativeFullTextGlobalIndexerFactory.IDENTIFIER);
+    }
+
+    private static Map<String, String> ngramTokenCharsOptions() {
+        Map<String, String> opts = new java.util.LinkedHashMap<>();
+        opts.put("full-text.tokenizer", "ngram");
+        opts.put("full-text.ngram.min-gram", "3");
+        opts.put("full-text.ngram.max-gram", "3");
+        opts.put("full-text.ngram.token-chars", "letter");
+        return opts;
+    }
+
+    private static Map<String, String> icuNormalizeOptions() {
+        Map<String, String> opts = new java.util.LinkedHashMap<>();
+        opts.put("full-text.icu-normalize", "nfkc");
+        return opts;
     }
 }

@@ -1302,6 +1302,111 @@ class JavaPyReadWriteTest(unittest.TestCase):
             f"'中文' AND '自然': row_ids={jieba_and_row_ids}")
         self.assertEqual(jieba_and_row_ids, [3])
 
+    def test_read_native_full_text_index_icu_tokenizer(self):
+        """Test reading a Native full-text index built with ICU tokenizer."""
+        icu_table = self.catalog.get_table('default.test_native_fulltext_icu')
+
+        # ICU word segmenter should segment Chinese text into words
+        builder = icu_table.new_full_text_search_builder()
+        builder.with_query('content', match_query('售货员'))
+        builder.with_limit(10)
+
+        result = builder.execute_local()
+        row_ids = sorted(list(result.results()))
+        print(f"Native full-text ICU search for '售货员': row_ids={row_ids}")
+        self.assertIn(0, row_ids)
+
+        # Search for '检索' - should match rows 1, 2, 3
+        builder2 = icu_table.new_full_text_search_builder()
+        builder2.with_query('content', match_query('检索'))
+        builder2.with_limit(10)
+
+        result2 = builder2.execute_local()
+        row_ids2 = sorted(list(result2.results()))
+        print(f"Native full-text ICU search for '检索': row_ids={row_ids2}")
+        self.assertIn(1, row_ids2)
+        self.assertIn(2, row_ids2)
+        self.assertIn(3, row_ids2)
+
+        # Verify reading matching rows
+        read_builder = icu_table.new_read_builder()
+        scan = read_builder.new_scan().with_global_index_result(result)
+        pa_table = read_builder.new_read().to_arrow(scan.plan().splits())
+        self.assertGreaterEqual(pa_table.num_rows, 1)
+        self.assertIn(0, pa_table.column('id').to_pylist())
+
+    def test_read_native_full_text_index_ngram_token_chars(self):
+        """Test reading a Native full-text index with NGram token-chars filter."""
+        table = self.catalog.get_table('default.test_native_fulltext_ngram_tokenchars')
+
+        # With token-chars=letter, only letter sequences generate ngrams.
+        # "abc123def" -> letters only: "abc", "def" as 3-grams
+        builder = table.new_full_text_search_builder()
+        builder.with_query('content', match_query('abc'))
+        builder.with_limit(10)
+
+        result = builder.execute_local()
+        row_ids = sorted(list(result.results()))
+        print(f"Native full-text ngram token-chars search for 'abc': row_ids={row_ids}")
+        self.assertIn(0, row_ids)
+
+        # "def" should also match row 0 (letters after digit break)
+        builder2 = table.new_full_text_search_builder()
+        builder2.with_query('content', match_query('def'))
+        builder2.with_limit(10)
+
+        result2 = builder2.execute_local()
+        row_ids2 = sorted(list(result2.results()))
+        print(f"Native full-text ngram token-chars search for 'def': row_ids={row_ids2}")
+        self.assertIn(0, row_ids2)
+
+        # "xyz" should match row 2 ("xyz789ghi")
+        builder3 = table.new_full_text_search_builder()
+        builder3.with_query('content', match_query('xyz'))
+        builder3.with_limit(10)
+
+        result3 = builder3.execute_local()
+        row_ids3 = sorted(list(result3.results()))
+        print(f"Native full-text ngram token-chars search for 'xyz': row_ids={row_ids3}")
+        self.assertIn(2, row_ids3)
+
+    def test_read_native_full_text_index_icu_normalize(self):
+        """Test reading a Native full-text index with ICU NFKC normalization."""
+        table = self.catalog.get_table('default.test_native_fulltext_icu_normalize')
+
+        # Fullwidth 'Ａ' in row 0 should be NFKC-normalized to 'A'
+        # so searching "apache" should match both row 0 and row 1
+        builder = table.new_full_text_search_builder()
+        builder.with_query('content', match_query('apache'))
+        builder.with_limit(10)
+
+        result = builder.execute_local()
+        row_ids = sorted(list(result.results()))
+        print(f"Native full-text ICU normalize search for 'apache': row_ids={row_ids}")
+        self.assertIn(0, row_ids)
+        self.assertIn(1, row_ids)
+
+        # Fullwidth 'Ｐ' in row 2 normalized to 'P' -> lowercased to 'p'
+        # searching "paimon" should match rows 0 and 2
+        builder2 = table.new_full_text_search_builder()
+        builder2.with_query('content', match_query('paimon'))
+        builder2.with_limit(10)
+
+        result2 = builder2.execute_local()
+        row_ids2 = sorted(list(result2.results()))
+        print(f"Native full-text ICU normalize search for 'paimon': row_ids={row_ids2}")
+        self.assertIn(0, row_ids2)
+        self.assertIn(2, row_ids2)
+
+        # Verify reading matching rows
+        read_builder = table.new_read_builder()
+        scan = read_builder.new_scan().with_global_index_result(result)
+        pa_table = read_builder.new_read().to_arrow(scan.plan().splits())
+        pa_table = table_sort_by(pa_table, 'id')
+        ids = pa_table.column('id').to_pylist()
+        self.assertIn(0, ids)
+        self.assertIn(1, ids)
+
     def test_read_lumina_vector_index(self):
         """Test reading a Lumina vector index built by Java (orc and lance formats)."""
         test_cases = [('default.test_lumina_vector', 'orc')]

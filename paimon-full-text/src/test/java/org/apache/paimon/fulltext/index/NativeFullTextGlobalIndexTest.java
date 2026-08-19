@@ -437,6 +437,116 @@ public class NativeFullTextGlobalIndexTest {
         }
     }
 
+    @Test
+    public void testIcuTokenizerSegmentsChinese() throws IOException {
+        Options options = new Options();
+        options.set("full-text.tokenizer", "icu");
+
+        GlobalIndexFileWriter fileWriter = createFileWriter(indexPath);
+        NativeFullTextGlobalIndexWriter writer =
+                new NativeFullTextGlobalIndexWriter(fileWriter, indexOptions(options));
+
+        writer.write(BinaryString.fromString("张华在百货公司当售货员"), 0);
+        writer.write(BinaryString.fromString("Apache Paimon 支持中文全文检索"), 1);
+        writer.write(BinaryString.fromString("全文索引提供高效的文本检索能力"), 2);
+
+        List<ResultEntry> results = writer.finish();
+        assertThat(serializedOptions(results.get(0).meta())).containsEntry("tokenizer", "icu");
+
+        List<GlobalIndexIOMeta> metas = toIOMetas(results, indexPath);
+        GlobalIndexFileReader fileReader = createFileReader();
+
+        try (NativeFullTextGlobalIndexReader reader = createReader(fileReader, metas)) {
+            FullTextSearch search = new FullTextSearch("text", matchQuery("售货员"), 10);
+            Optional<ScoredGlobalIndexResult> searchResult =
+                    reader.visitFullTextSearch(search).join();
+            assertThat(searchResult).isPresent();
+            assertThat(searchResult.get().results().contains(0L)).isTrue();
+
+            FullTextSearch search2 = new FullTextSearch("text", matchQuery("检索"), 10);
+            Optional<ScoredGlobalIndexResult> result2 = reader.visitFullTextSearch(search2).join();
+            assertThat(result2).isPresent();
+            RoaringNavigableMap64 rowIds2 = result2.get().results();
+            assertThat(rowIds2.contains(1L)).isTrue();
+            assertThat(rowIds2.contains(2L)).isTrue();
+        }
+    }
+
+    @Test
+    public void testNgramTokenCharsFiltersNonLetterChars() throws IOException {
+        Options options = new Options();
+        options.set("full-text.tokenizer", "ngram");
+        options.set("full-text.ngram.min-gram", "3");
+        options.set("full-text.ngram.max-gram", "3");
+        options.set("full-text.ngram.token-chars", "letter");
+
+        GlobalIndexFileWriter fileWriter = createFileWriter(indexPath);
+        NativeFullTextGlobalIndexWriter writer =
+                new NativeFullTextGlobalIndexWriter(fileWriter, indexOptions(options));
+
+        writer.write(BinaryString.fromString("abc123def"), 0);
+        writer.write(BinaryString.fromString("xyz789ghi"), 1);
+
+        List<ResultEntry> results = writer.finish();
+        Map<String, String> meta = serializedOptions(results.get(0).meta());
+        assertThat(meta).containsEntry("ngram.token-chars", "letter");
+
+        List<GlobalIndexIOMeta> metas = toIOMetas(results, indexPath);
+        GlobalIndexFileReader fileReader = createFileReader();
+
+        try (NativeFullTextGlobalIndexReader reader = createReader(fileReader, metas)) {
+            // "abc" is a 3-gram from letters only (digits are stripped)
+            FullTextSearch search = new FullTextSearch("text", matchQuery("abc"), 10);
+            Optional<ScoredGlobalIndexResult> searchResult =
+                    reader.visitFullTextSearch(search).join();
+            assertThat(searchResult).isPresent();
+            assertThat(searchResult.get().results().contains(0L)).isTrue();
+
+            // "def" should match row 0 (letters after digit break form their own ngrams)
+            FullTextSearch search2 = new FullTextSearch("text", matchQuery("def"), 10);
+            Optional<ScoredGlobalIndexResult> result2 = reader.visitFullTextSearch(search2).join();
+            assertThat(result2).isPresent();
+            assertThat(result2.get().results().contains(0L)).isTrue();
+
+            // "xyz" should match row 1 ("xyz789ghi" -> letters include "xyz")
+            FullTextSearch search3 = new FullTextSearch("text", matchQuery("xyz"), 10);
+            Optional<ScoredGlobalIndexResult> result3 = reader.visitFullTextSearch(search3).join();
+            assertThat(result3).isPresent();
+            assertThat(result3.get().results().contains(1L)).isTrue();
+        }
+    }
+
+    @Test
+    public void testIcuNormalizeFilterWithNfkc() throws IOException {
+        Options options = new Options();
+        options.set("full-text.icu-normalize", "nfkc");
+
+        GlobalIndexFileWriter fileWriter = createFileWriter(indexPath);
+        NativeFullTextGlobalIndexWriter writer =
+                new NativeFullTextGlobalIndexWriter(fileWriter, indexOptions(options));
+
+        // U+FF21 = fullwidth 'Ａ', NFKC normalizes to 'A' then lowercased to 'a'
+        writer.write(BinaryString.fromString("Ａpache Paimon"), 0);
+        writer.write(BinaryString.fromString("Apache Flink"), 1);
+
+        List<ResultEntry> results = writer.finish();
+        assertThat(serializedOptions(results.get(0).meta())).containsEntry("icu-normalize", "nfkc");
+
+        List<GlobalIndexIOMeta> metas = toIOMetas(results, indexPath);
+        GlobalIndexFileReader fileReader = createFileReader();
+
+        try (NativeFullTextGlobalIndexReader reader = createReader(fileReader, metas)) {
+            // Searching "apache" should match row 0 (fullwidth A normalized) and row 1
+            FullTextSearch search = new FullTextSearch("text", matchQuery("apache"), 10);
+            Optional<ScoredGlobalIndexResult> searchResult =
+                    reader.visitFullTextSearch(search).join();
+            assertThat(searchResult).isPresent();
+            RoaringNavigableMap64 rowIds = searchResult.get().results();
+            assertThat(rowIds.contains(0L)).isTrue();
+            assertThat(rowIds.contains(1L)).isTrue();
+        }
+    }
+
     private static String matchQuery(String terms) {
         return "{\"match\":{\"query\":\"" + terms + "\"}}";
     }
